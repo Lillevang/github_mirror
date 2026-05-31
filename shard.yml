@@ -1,0 +1,13 @@
+name: github_mirror
+version: 0.1.0
+
+authors:
+  - Jeppe Lillevang Salling <jeppe.lillevang@gmail.com>
+
+targets:
+  github_mirror:
+    main: src/github_mirror.cr
+
+crystal: '>= 1.20.2'
+
+license: MIT

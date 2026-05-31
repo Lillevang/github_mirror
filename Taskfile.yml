@@ -1,0 +1,35 @@
+version: '3'
+
+vars:
+  REGISTRY: ghcr.io/lillevang          # or git.lillevang.dev/lillevang, or nas:5000
+  IMAGE: '{{.REGISTRY}}/github-mirror'
+  # Tag from git so what's pushed is traceable to a commit
+  TAG:
+    sh: git rev-parse --short HEAD
+
+tasks:
+  build:
+    desc: Build the static image
+    cmds:
+      - podman build -t {{.IMAGE}}:{{.TAG}} -t {{.IMAGE}}:latest .
+
+  push:
+    desc: Build and push to the registry
+    deps: [build]
+    cmds:
+      - podman push {{.IMAGE}}:{{.TAG}}
+      - podman push {{.IMAGE}}:latest
+
+  run:
+    desc: Run locally against a test dir
+    cmds:
+      - podman run --rm --user 0:0
+        -v {{.DATA_DIR | default "/tmp/data2"}}:/data:Z
+        -v {{.TOKEN_FILE | default "/tmp/gh_token_fga.txt"}}:/run/gh-pat:ro,Z
+        -e GH_TOKEN_FILE=/run/gh-pat -e MIRROR_DIR=/data -e GIT_TIMEOUT=300
+        {{.IMAGE}}:{{.TAG}}
+
+  test:
+    desc: Run the spec suite
+    cmds:
+      - crystal spec
