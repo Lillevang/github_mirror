@@ -303,4 +303,3 @@ module GithubMirror
   end
 end
 
-GithubMirror.main if PROGRAM_NAME.includes?("github_mirror") && !PROGRAM_NAME.includes?("spec")

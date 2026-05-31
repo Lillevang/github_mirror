@@ -3,7 +3,7 @@ WORKDIR /src
 COPY shard.yml shard.lock ./
 RUN shards install
 COPY . .
-RUN crystal build src/github_mirror.cr --release --static --no-debug -o /github-mirror
+RUN crystal build src/main.cr --release --static --no-debug -o /github-mirror
 RUN file /github-mirror; ldd /github-mirror || true
 
 FROM docker.io/alpine:3.22
