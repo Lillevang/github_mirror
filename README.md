@@ -2,8 +2,8 @@
 
 A small, single-purpose tool that maintains local **bare mirrors** of every
 GitHub repository a token can see. Point it at a directory, give it a
-read-only token, and it keeps a complete, offline-restorable copy of your repos
-— branches, tags, and notes — so your code survives losing access to GitHub
+read-only token, and it keeps a complete, offline-restorable copy of your repos,
+including branches, tags, and notes, so your code survives losing access to GitHub
 (account lockout, an outage, or just wanting to leave).
 
 It is intentionally boring: enumerate, clone or update, record what happened,
@@ -22,7 +22,7 @@ exit. Failures are reported loudly and never mistaken for success.
 - **It only ever adds and updates.** A repo that disappears upstream (you
   deleted it, or lost account access) is left **dormant** on disk, never
   deleted. The local copy is meant to outlive the remote.
-- It mirrors **git data only** — not issues, pull requests, releases, or
+- It mirrors **git data only**: not issues, pull requests, releases, or
   wikis. If you need those, you need a separate API export.
 - It is **not a backup by itself.** A mirror protects against losing GitHub; it
   does not protect against losing the disk it lives on. Run a real backup
@@ -52,7 +52,7 @@ The mirror directory must be **writable by uid 1000** (the `backup` user the
 image runs as). On first run everything is a fresh clone; subsequent runs are
 fast incremental updates.
 
-`docker run` works identically — substitute `docker` for `podman`.
+`docker run` works identically. Substitute `docker` for `podman`.
 
 ## Configuration
 
@@ -64,8 +64,8 @@ All configuration is via environment variables.
 | `MIRROR_DIR`       | `/data`   | Directory the bare mirrors are written into.                         |
 | `GIT_TIMEOUT`      | *(none)*  | Per-git-invocation timeout in seconds. A safety net against hung operations; set well above your slowest legitimate clone. `300` is a sane default. |
 | `INCLUDE_FORKS`    | `false`   | Mirror repos that are forks.                                         |
-| `INCLUDE_ARCHIVED` | `true`    | Mirror archived repos (usually what you want — archived code is exactly what's worth preserving). |
-| `FETCH_LFS`        | `false`   | Also fetch Git LFS objects. Requires `git-lfs` in the image (commented out in the Dockerfile by default) — a plain `--mirror` clone only stores LFS *pointers*, not the objects. |
+| `INCLUDE_ARCHIVED` | `true`    | Mirror archived repos (usually what you want, since archived code is exactly what's worth preserving). |
+| `FETCH_LFS`        | `false`   | Also fetch Git LFS objects. Requires `git-lfs` in the image (commented out in the Dockerfile by default). A plain `--mirror` clone only stores LFS *pointers*, not the objects. |
 | `GH_AFFILIATION`   | `owner`   | GitHub `affiliation` filter (`owner`, `collaborator`, `organization_member`). |
 | `GH_VISIBILITY`    | `all`     | GitHub `visibility` filter (`all`, `public`, `private`).             |
 
@@ -107,9 +107,9 @@ Each run writes `mirror-state.json` into `MIRROR_DIR`:
 
 The exit code is the primary signal for automation:
 
-- `0` — all selected repos mirrored cleanly.
-- `1` — operational failure (a repo failed, or enumeration failed: bad token, API error).
-- `2` — configuration error (no token file, unreadable token file).
+- `0`: all selected repos mirrored cleanly.
+- `1`: operational failure (a repo failed, or enumeration failed: bad token, API error).
+- `2`: configuration error (no token file, unreadable token file).
 
 For alerting, key off the exit code (catches both a dead token and a failed
 repo in one check). On a schedule, a wrapper that POSTs to a webhook on
@@ -117,14 +117,14 @@ non-zero exit is enough.
 
 **Active vs. dormant repos:** a repo is *active* in a run if its `last_attempt`
 equals the run's `last_run`. A repo whose `last_attempt` has stopped advancing
-is *dormant* — it no longer appears upstream and is intentionally left in place.
+is *dormant*: it no longer appears upstream and is intentionally left in place.
 A staleness check should only consider active repos, so dormant ones don't
 alert forever. `last_success` is preserved across failures, so a repo that
 worked before and then fails keeps its real last-success timestamp.
 
 ## Building
 
-Requires a token with `read:packages` is **not** needed to pull (the image is
+A token with `read:packages` is **not** needed to pull (the image is
 public). To build and push your own:
 
 ```sh
@@ -137,24 +137,19 @@ task test    # crystal spec
 The image is a multi-stage build: a static, musl-linked binary compiled in an
 Alpine Crystal builder, copied into a minimal Alpine runtime with `git` and
 `ca-certificates`. Static linking is done in the Alpine builder because Crystal
-`--static` is supported on musl and fragile on glibc — don't try to build it on
+`--static` is supported on musl and fragile on glibc, so don't try to build it on
 a glibc host.
 
 For local development, build a **dynamic** binary instead
-(`crystal build src/github_mirror.cr`), which links against your host libs and
+(`crystal build src/main.cr`), which links against your host libs and
 runs directly. Static is only for the deployment image.
-
-> Note: the binary's entrypoint is guarded by a `PROGRAM_NAME` check so the
-> spec can `require` the source without running `main`. This works but is
-> brittle to renames; a separate `src/main.cr` entrypoint would be cleaner if
-> revisiting.
 
 ## Tests
 
 `crystal spec` covers the pure logic: Link-header pagination parsing
 (`parse_next_link`) and the fork/archived filter (`select_repos`). The I/O paths
 (enumeration, git subprocesses, token reading) are deliberately **not**
-unit-tested — they're validated by running against real GitHub and git, since
+unit-tested. They're validated by running against real GitHub and git, since
 mocking them would only assert that the mocks behave like the mocks.
 
 ## Recommended deployment shape
@@ -166,6 +161,15 @@ mocking them would only assert that the mocks behave like the mocks.
 
 The mirror gives you availability; the off-host backup is what makes it durable.
 Don't conflate the two.
+
+## Planned: relay mode
+
+A second mode is planned for a different topology: a bare git server in a
+network zone that cannot reach Azure DevOps, and a host in a trusted zone that
+pulls from it over SSH and pushes to Azure DevOps. Azure DevOps owns `main`
+and release branches, which flow back the other way. Nothing is initiated from
+the untrusted zone. The design and build order are tracked in
+[issue #8](https://github.com/Lillevang/github_mirror/issues/8).
 
 ## License
 

@@ -51,7 +51,7 @@ module GithubMirror
       return default
     end
     Log.info{"#{name}: #{ENV[name]}"}
-    return bool_vals === ENV[name].downcase
+    return bool_vals.includes?(ENV[name].downcase)
   end
 
   def read_token() : String
@@ -154,7 +154,7 @@ module GithubMirror
   #
   # TODO: cancel the timeout timer on completion before adding the concurrent clone pool.
   # As written, a fast-finishing git leaves a fiber sleeping the full timeout; harmless when sequential, but N sleepers
-  # accumulate under concurrency. Replace with a Chhannel/select-based cancellation then.
+  # accumulate under concurrency. Replace with a Channel/select-based cancellation then.
   def run_git(args : Array(String), env : Hash(String, String), timeout : Int32?) : {Bool, String}
     stdout = IO::Memory.new
     stderr = IO::Memory.new
