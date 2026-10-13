@@ -1,0 +1,46 @@
+# Thin runner for the Taskfile. Every step below is a `task` command that
+# works identically on a laptop; GitHub Actions only supplies the machine
+# and a token to attach the assets and push the image. `task release`
+# pushes the tag that triggers this. Fallback if Actions is unavailable:
+# `task dist image publish image-push` from any machine with podman and gh.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Crystal
+        uses: crystal-lang/install-crystal@v1
+        with:
+          crystal: latest
+
+      - name: Install Task
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          sh -c "$(curl --fail --location https://taskfile.dev/install.sh)" -- -d -b "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - run: task check-tag
+      - run: task verify
+      - run: task dist
+      - run: task image
+
+      - name: Log in to ghcr.io
+        run: echo "${{ github.token }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - run: task publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - run: task image-push

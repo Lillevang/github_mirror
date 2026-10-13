@@ -1,35 +1,263 @@
+# https://taskfile.dev
+#
+# CI/CD for github-mirror lives in this file. Every check, build and publish
+# step is a `task` command that runs the same way on a laptop as on a GitHub
+# runner; the workflows in .github/ are thin wrappers that call these tasks.
+# If Actions is ever unavailable, `task dist image publish image-push` cuts
+# the same release from here.
+#
+#   task                 same as `task verify`
+#   task verify          format check + specs + build + smoke test
+#   task image           build the container image and smoke test it
+#   task run             run the image against a local directory
+#   task bump            bump the patch version (TARGET=minor|major for the others)
+#   task release         verify, tag vX.Y.Z and push it — the workflow does the rest
+#   task dist            static Linux binary to dist/ (built in the Alpine stage)
+#   task publish         create/update the GitHub release for the current tag
+#   task image-push      push the image for the current tag to the registry
+
 version: '3'
 
+# Applies to every command block: a failure anywhere aborts the task, rather
+# than Task reporting the exit code of the block's last line.
+set: [errexit, nounset, pipefail]
+
 vars:
-  REGISTRY: ghcr.io/lillevang          # or git.lillevang.dev/lillevang, or nas:5000
-  IMAGE: '{{.REGISTRY}}/github-mirror'
-  # Tag from git so what's pushed is traceable to a commit
-  TAG:
-    sh: git rev-parse --short HEAD
+  BIN: github-mirror
+  VERSION_FILE: src/version.cr
+  # src/version.cr is the single source of truth; shard.yml mirrors it and
+  # `preflight` refuses to release while the two disagree.
+  VERSION:
+    sh: grep -Eo 'VERSION[[:space:]]*=[[:space:]]*"[^"]+"' src/version.cr | sed -E 's/.*"([^"]+)".*/\1/'
+  TAG: 'v{{.VERSION}}'
+  DIST: dist
+  REGISTRY: ghcr.io/lillevang
+  IMAGE: '{{.REGISTRY}}/{{.BIN}}'
+  # podman on the laptop, docker where that is all there is (CONTAINER=docker
+  # overrides). The two share a CLI for everything used here.
+  CONTAINER:
+    sh: command -v podman > /dev/null 2>&1 && echo podman || echo docker
+  # Asset name follows the GoReleaser convention (linux-amd64, linux-arm64).
+  # The binary is built in a container on the host's architecture.
+  ARCH:
+    sh: case "$(uname -m)" in x86_64) echo amd64;; aarch64|arm64) echo arm64;; *) uname -m;; esac
+  ASSET: '{{.BIN}}-linux-{{.ARCH}}'
 
 tasks:
-  build:
-    desc: Build the static image
-    cmds:
-      - podman build -t {{.IMAGE}}:{{.TAG}} -t {{.IMAGE}}:latest .
 
-  push:
-    desc: Build and push to the registry
-    deps: [build]
+  default:
     cmds:
-      - podman push {{.IMAGE}}:{{.TAG}}
-      - podman push {{.IMAGE}}:latest
+      - task: verify
 
-  run:
-    desc: Run locally against a test dir
+  fmt:
+    desc: Format all Crystal sources in place
     cmds:
-      - podman run --rm --user 0:0
-        -v {{.DATA_DIR | default "/tmp/data2"}}:/data:Z
-        -v {{.TOKEN_FILE | default "/tmp/gh_token_fga.txt"}}:/run/gh-pat:ro,Z
-        -e GH_TOKEN_FILE=/run/gh-pat -e MIRROR_DIR=/data -e GIT_TIMEOUT=300
-        {{.IMAGE}}:{{.TAG}}
+      - crystal tool format
+
+  lint:
+    desc: Fail if any source is not formatted
+    cmds:
+      - crystal tool format --check
 
   test:
     desc: Run the spec suite
     cmds:
       - crystal spec
+
+  build:
+    desc: Debug build to bin/github-mirror (dynamic, links against host libs)
+    cmds:
+      - shards build
+
+  smoke:
+    desc: Check the freshly built binary reports its version and fails loudly without a token
+    silent: true
+    cmds:
+      - |
+        [ "$(bin/{{.BIN}} --version)" = "{{.VERSION}}" ] || { echo "❌ smoke test: --version printed $(bin/{{.BIN}} --version), expected {{.VERSION}}"; exit 1; }
+        bin/{{.BIN}} --help | grep -q GH_TOKEN_FILE || { echo "❌ smoke test: --help does not document GH_TOKEN_FILE"; exit 1; }
+        # A missing token must be a configuration error (exit 2), never a
+        # silent "no repos" success.
+        set +e
+        OUT=$(env -u GH_TOKEN_FILE MIRROR_DIR="$(mktemp -d)" bin/{{.BIN}} 2>&1)
+        STATUS=$?
+        set -e
+        [ "$STATUS" -eq 2 ] || { echo "❌ smoke test: run without GH_TOKEN_FILE exited $STATUS, expected 2"; echo "$OUT"; exit 1; }
+        echo "$OUT" | grep -q 'GH_TOKEN_FILE is not set' || { echo "❌ smoke test: missing-token error not reported"; echo "$OUT"; exit 1; }
+        echo "✅ Smoke test passed ({{.BIN}} {{.VERSION}})"
+
+  verify:
+    desc: Format check, specs, build and smoke test — the local CI run
+    cmds:
+      - task: lint
+      - task: test
+      - task: build
+      - task: smoke
+
+  image:
+    desc: Build the container image, tagged :<version> and :latest, and smoke test it
+    silent: true
+    cmds:
+      - |
+        echo "🔨 Building {{.IMAGE}}:{{.VERSION}} with {{.CONTAINER}}"
+        {{.CONTAINER}} build -t {{.IMAGE}}:{{.VERSION}} -t {{.IMAGE}}:latest .
+        GOT=$({{.CONTAINER}} run --rm {{.IMAGE}}:{{.VERSION}} --version)
+        [ "$GOT" = "{{.VERSION}}" ] || { echo "❌ image reports version $GOT, expected {{.VERSION}}"; exit 1; }
+        echo "✅ {{.IMAGE}}:{{.VERSION}} ($({{.CONTAINER}} image inspect {{.IMAGE}}:{{.VERSION}} --format '{{"{{.Size}}"}}' | awk '{printf "%.0f MB", $1/1000000}'))"
+
+  run:
+    desc: Run the image against a local directory (DATA_DIR and TOKEN_FILE override the defaults)
+    vars:
+      DATA_DIR: '{{.DATA_DIR | default "/tmp/github-mirror-data"}}'
+      TOKEN_FILE: '{{.TOKEN_FILE | default "/tmp/gh_token.txt"}}'
+    cmds:
+      - mkdir -p {{.DATA_DIR}}
+      - >
+        {{.CONTAINER}} run --rm --user 0:0
+        -v {{.DATA_DIR}}:/data:Z
+        -v {{.TOKEN_FILE}}:/run/gh-pat:ro,Z
+        -e GH_TOKEN_FILE=/run/gh-pat -e MIRROR_DIR=/data -e GIT_TIMEOUT=300
+        {{.IMAGE}}:{{.VERSION}}
+
+  bump:
+    silent: true
+    desc: Bump version in src/version.cr and shard.yml (TARGET=patch|minor|major)
+    vars:
+      TARGET: '{{.TARGET | default "patch"}}'
+    cmds:
+      - |
+        CURRENT="{{.VERSION}}"
+        # Validate before computing: a malformed version would otherwise be
+        # coerced by the arithmetic into a plausible-looking wrong one.
+        echo "$CURRENT" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+          echo "❌ malformed version in {{.VERSION_FILE}}: '$CURRENT' (want MAJOR.MINOR.PATCH)"
+          exit 1
+        }
+        IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+        case "{{.TARGET}}" in
+          patch) PATCH=$((PATCH+1));;
+          minor) MINOR=$((MINOR+1)); PATCH=0;;
+          major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0;;
+          *) echo "❌ unknown bump target: {{.TARGET}}"; exit 1;;
+        esac
+        NEW="$MAJOR.$MINOR.$PATCH"
+        sed -i.bak -E "s/VERSION[[:space:]]*=[[:space:]]*\"[^\"]*\"/VERSION = \"$NEW\"/" {{.VERSION_FILE}} && rm -f {{.VERSION_FILE}}.bak
+        sed -i.bak -E "s/^version:.*/version: $NEW/" shard.yml && rm -f shard.yml.bak
+        echo "🔼 Bumped version: $CURRENT → $NEW"
+        echo "   Commit it, then run 'task release'."
+
+  preflight:
+    silent: true
+    internal: true
+    cmds:
+      - |
+        SHARD_VERSION=$(grep -E '^version:' shard.yml | sed -E 's/^version:[[:space:]]*//')
+        if [ "$SHARD_VERSION" != "{{.VERSION}}" ]; then
+          echo "❌ shard.yml says $SHARD_VERSION but {{.VERSION_FILE}} says {{.VERSION}} — run 'task bump' or fix by hand"
+          exit 1
+        fi
+        BRANCH=$(git rev-parse --abbrev-ref HEAD)
+        if [ "$BRANCH" != "main" ]; then
+          echo "❌ releases are cut from main, not '$BRANCH'"
+          exit 1
+        fi
+        # The tag must point at exactly what is being built.
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "❌ working tree is not clean — commit or stash first"
+          git status --short
+          exit 1
+        fi
+        if git rev-parse -q --verify "refs/tags/{{.TAG}}" > /dev/null; then
+          echo "❌ tag {{.TAG}} already exists locally — bump the version first"
+          exit 1
+        fi
+        if git ls-remote --exit-code --tags origin "refs/tags/{{.TAG}}" > /dev/null 2>&1; then
+          echo "❌ tag {{.TAG}} already exists on origin — bump the version first"
+          exit 1
+        fi
+
+  dist:
+    silent: true
+    desc: Static Linux binary to dist/github-mirror-linux-<arch> with a sha256 next to it
+    cmds:
+      - |
+        # The static binary comes out of the Dockerfile's build stage, so the
+        # release asset is byte-for-byte the binary inside the image.
+        mkdir -p {{.DIST}}
+        echo "🔨 Building {{.ASSET}} ({{.TAG}}) in the Alpine build stage with {{.CONTAINER}}"
+        {{.CONTAINER}} build --target build -t {{.IMAGE}}:build .
+        ID=$({{.CONTAINER}} create {{.IMAGE}}:build)
+        {{.CONTAINER}} cp "$ID:/github-mirror" {{.DIST}}/{{.ASSET}}
+        {{.CONTAINER}} rm "$ID" > /dev/null
+        chmod +x {{.DIST}}/{{.ASSET}}
+        [ "$({{.DIST}}/{{.ASSET}} --version)" = "{{.VERSION}}" ] || { echo "❌ {{.ASSET}} reports version $({{.DIST}}/{{.ASSET}} --version), expected {{.VERSION}}"; exit 1; }
+        (cd {{.DIST}} && sha256sum {{.ASSET}} > {{.ASSET}}.sha256)
+        echo "✅ {{.DIST}}/{{.ASSET}} ($(du -h {{.DIST}}/{{.ASSET}} | cut -f1))"
+
+  release:
+    desc: Verify, tag vX.Y.Z and push — the release workflow builds and publishes from the tag
+    silent: true
+    cmds:
+      - task: preflight
+      - task: verify
+      - |
+        echo "🏷  Tagging {{.TAG}}"
+        git tag -a "{{.TAG}}" -m "Release {{.TAG}}"
+        git push origin main
+        git push origin "{{.TAG}}"
+        echo ""
+        echo "✅ Pushed {{.TAG}}. The release workflow is now building the binary and image:"
+        echo "   $(gh repo view --json url -q .url 2>/dev/null || echo https://github.com/Lillevang/github_mirror)/actions"
+        echo "   Fallback if it fails: task dist image publish image-push"
+
+  check-tag:
+    desc: Fail unless HEAD carries the tag that matches src/version.cr
+    silent: true
+    cmds:
+      - |
+        # Guards the workflow against a tag pushed without bumping the version
+        # (the assets and image would carry the old version) and `publish` /
+        # `image-push` against shipping a build of the wrong commit.
+        if ! git tag --points-at HEAD | grep -qx "{{.TAG}}"; then
+          echo "❌ HEAD is not tagged {{.TAG}} ({{.VERSION_FILE}} says {{.VERSION}})"
+          echo "   tags at HEAD: $(git tag --points-at HEAD | tr '\n' ' ')"
+          echo "   run 'task release' to tag, or fix the version first"
+          exit 1
+        fi
+
+  publish:
+    desc: Create or update the GitHub release for the current tag from dist/
+    silent: true
+    cmds:
+      - task: check-tag
+      - |
+        gh auth status > /dev/null 2>&1 || { echo "❌ gh is not logged in — run 'gh auth login' (or set GH_TOKEN)"; exit 1; }
+        ls {{.DIST}}/{{.BIN}}-* > /dev/null 2>&1 || { echo "❌ nothing in {{.DIST}}/ — run 'task dist' first"; exit 1; }
+        # `--clobber` makes a re-run replace assets instead of failing on the duplicate.
+        if gh release view "{{.TAG}}" > /dev/null 2>&1; then
+          echo "📦 Release {{.TAG}} exists — uploading assets"
+          gh release upload "{{.TAG}}" {{.DIST}}/{{.BIN}}-* --clobber
+        else
+          echo "📦 Creating release {{.TAG}}"
+          gh release create "{{.TAG}}" --title "{{.TAG}}" --generate-notes \
+            --notes "Container image: \`{{.IMAGE}}:{{.VERSION}}\`" \
+            {{.DIST}}/{{.BIN}}-*
+        fi
+        echo "✅ $(gh release view "{{.TAG}}" --json url -q .url)"
+
+  image-push:
+    desc: Push the :<version> and :latest image tags for the current tag (log in to the registry first)
+    silent: true
+    cmds:
+      - task: check-tag
+      - |
+        {{.CONTAINER}} image inspect {{.IMAGE}}:{{.VERSION}} > /dev/null 2>&1 || { echo "❌ {{.IMAGE}}:{{.VERSION}} not built — run 'task image' first"; exit 1; }
+        echo "📤 Pushing {{.IMAGE}}:{{.VERSION}} and :latest"
+        {{.CONTAINER}} push {{.IMAGE}}:{{.VERSION}}
+        {{.CONTAINER}} push {{.IMAGE}}:latest
+        echo "✅ {{.IMAGE}}:{{.VERSION}}"
+
+  clean:
+    desc: Remove build outputs
+    cmds:
+      - rm -rf bin {{.DIST}} .crystal

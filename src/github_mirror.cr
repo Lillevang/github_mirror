@@ -2,6 +2,7 @@ require "log"
 require "base64"
 require "http/client"
 require "json"
+require "./version"
 
 struct Repo
   include JSON::Serializable
@@ -15,7 +16,7 @@ struct RepoState
   include JSON::Serializable
   property last_attempt : String
   property last_status : String
-  property last_success :  String?
+  property last_success : String?
 
   def initialize(@last_attempt, @last_status, @last_success = nil)
   end
@@ -23,7 +24,7 @@ end
 
 struct MirrorState
   include JSON::Serializable
-  property repos :  Hash(String, RepoState)
+  property repos : Hash(String, RepoState)
   property last_run : String?
   property last_run_repo_count : Int32?
   property last_run_failures : Int32?
@@ -37,8 +38,27 @@ end
 module GithubMirror
   extend self
 
-  VERSION = "0.1.0"
   GITHUB_API = "https://api.github.com"
+
+  USAGE = <<-USAGE
+    Usage: github-mirror [--version | --help]
+
+    Maintains bare mirrors of every GitHub repository a token can see.
+    There are no flags for normal operation; everything is configured
+    through environment variables:
+
+      GH_TOKEN_FILE     (required) file containing a GitHub token
+      MIRROR_DIR        directory the mirrors are written into     [/data]
+      GIT_TIMEOUT       per-git-invocation timeout in seconds      [none]
+      INCLUDE_FORKS     also mirror forks                          [false]
+      INCLUDE_ARCHIVED  also mirror archived repos                 [true]
+      FETCH_LFS         also fetch Git LFS objects                 [false]
+      GH_AFFILIATION    owner | collaborator | organization_member [owner]
+      GH_VISIBILITY     all | public | private                     [all]
+
+    Exit codes: 0 all repos mirrored, 1 a repo or the enumeration failed,
+    2 configuration error.
+    USAGE
 
   def now_iso : String
     Time.utc.to_rfc3339(fraction_digits: 0)
@@ -47,37 +67,37 @@ module GithubMirror
   def env_bool(name : String, default : Bool) : Bool
     bool_vals = Set{"1", "true", "yes", "on"}
     unless ENV.has_key?(name)
-      Log.info{"#{name}: #{default}"}
+      Log.info { "#{name}: #{default}" }
       return default
     end
-    Log.info{"#{name}: #{ENV[name]}"}
+    Log.info { "#{name}: #{ENV[name]}" }
     return bool_vals.includes?(ENV[name].downcase)
   end
 
-  def read_token() : String
+  def read_token : String
     unless ENV.has_key?("GH_TOKEN_FILE")
-      Log.fatal{"GH_TOKEN_FILE is not set"}
+      Log.fatal { "GH_TOKEN_FILE is not set" }
       exit(2)
     end
     path = ENV["GH_TOKEN_FILE"]
     token = begin
-      File.read(Path[path]).strip()
+      File.read(Path[path]).strip
     rescue ex : File::NotFoundError | File::AccessDeniedError | IO::Error
-      Log.fatal{"cannot read token file #{ENV["GH_TOKEN_FILE"]}"}
+      Log.fatal { "cannot read token file #{ENV["GH_TOKEN_FILE"]}" }
       exit(2)
     end
     if token.empty?
-      Log.fatal { "token file #{path} is empty "}
+      Log.fatal { "token file #{path} is empty" }
       exit(2)
     end
-    Log.info { "Github Token loaded" }
+    Log.info { "GitHub token loaded from #{path}" }
     token
   end
 
   def git_auth_env(token : String) : Hash(String, String)
     e = Hash(String, String).new
     basic = Base64.strict_encode("x-access-token:#{token}")
-    ENV.each {  |k, v| e[k] = v }
+    ENV.each { |k, v| e[k] = v }
     e["GIT_CONFIG_COUNT"] = "2"
     e["GIT_CONFIG_KEY_0"] = "http.extraHeader"
     e["GIT_CONFIG_VALUE_0"] = "AUTHORIZATION: basic #{basic}"
@@ -111,7 +131,7 @@ module GithubMirror
     visibility = ENV.fetch("GH_VISIBILITY", "all")
     url : String? = "#{GITHUB_API}/user/repos?per_page=100&affiliation=#{affiliation}&visibility=#{visibility}"
 
-    repos =  Array(Repo).new
+    repos = Array(Repo).new
     page_no = 0
 
     while current = url
@@ -121,24 +141,24 @@ module GithubMirror
       headers["Authorization"] = "Bearer #{token}"
       headers["Accept"] = "application/vnd.github+json"
       headers["X-GitHub-Api-Version"] = "2022-11-28"
-      headers["User-Agent"] = "github-mirror-backup"
+      headers["User-Agent"] = "github-mirror/#{VERSION}"
 
       response = begin
         HTTP::Client.get(current, headers: headers)
       rescue ex : IO::Error
-        Log.fatal{ "cannot  reach GitHub API on page #{page_no}: #{ex.message}"}
+        Log.fatal { "cannot reach GitHub API on page #{page_no}: #{ex.message}" }
         exit(1)
       end
 
       unless response.success?
-        Log.fatal{ "GitHub API #{response.status_code} on page #{page_no}: #{response.body}"}
+        Log.fatal { "GitHub API #{response.status_code} on page #{page_no}: #{response.body}" }
         exit(1)
       end
 
-      page =  begin
+      page = begin
         Array(Repo).from_json(response.body)
       rescue ex : JSON::ParseException
-        Log.fatal{ "could not parse API response on page #{page_no}: #{ex.message}"}
+        Log.fatal { "could not parse API response on page #{page_no}: #{ex.message}" }
         exit(1)
       end
 
@@ -148,7 +168,6 @@ module GithubMirror
 
     repos
   end
-
 
   # Run a git subprocess with the given environment. Returns {success, error}.
   #
@@ -172,7 +191,7 @@ module GithubMirror
         sleep timeout.seconds
         process.terminate(graceful: false) unless process.terminated?
       rescue
-      # Process gone, nothing to do
+        # Process gone, nothing to do
       end
     end
 
@@ -238,26 +257,48 @@ module GithubMirror
   end
 
   def main
-    Log.info{"Github Mirror started"}
-    Log.info{"Loading configuration"}
-    mirror_root = Path[ENV.fetch("MIRROR_DIR", "/data")]
-    Dir.mkdir_p(mirror_root)
+    case ARGV[0]?
+    when nil
+      # fall through: a normal run
+    when "-v", "--version"
+      puts VERSION
+      return
+    when "-h", "--help"
+      puts USAGE
+      return
+    else
+      STDERR.puts "github-mirror: unknown argument #{ARGV[0]}"
+      STDERR.puts USAGE
+      exit(2)
+    end
+
+    Log.info { "github-mirror #{VERSION} started" }
+    Log.info { "Loading configuration" }
 
     include_forks = env_bool("INCLUDE_FORKS", false)
     include_archived = env_bool("INCLUDE_ARCHIVED", true)
     fetch_lfs = env_bool("FETCH_LFS", false)
     timeout = ENV["GIT_TIMEOUT"]?.try(&.to_i32?)
-    Log.info{"Timeout: #{timeout}"}
+    Log.info { "GIT_TIMEOUT: #{timeout || "none"}" }
 
     token = read_token()
     auth_env = git_auth_env(token)
-    Log.info{"Configuration loaded successfully!"}
-    Log.info{"Enumerating repos..."}
+
+    mirror_root = Path[ENV.fetch("MIRROR_DIR", "/data")]
+    begin
+      Dir.mkdir_p(mirror_root)
+    rescue ex : File::Error
+      Log.fatal { "cannot create MIRROR_DIR #{mirror_root}: #{ex.message}" }
+      exit(2)
+    end
+    Log.info { "MIRROR_DIR: #{mirror_root}" }
+    Log.info { "Configuration loaded successfully!" }
+    Log.info { "Enumerating repos..." }
     repos = enumerate_repos(token)
-    Log.info{"Enumeration returned #{repos.size} repositories"}
+    Log.info { "Enumeration returned #{repos.size} repositories" }
     selected = select_repos(repos, include_forks, include_archived)
     skipped = repos.size - selected.size
-    Log.info{"Skipped #{skipped} repositories (fork/archived filters)"}
+    Log.info { "Skipped #{skipped} repositories (fork/archived filters)" }
 
     state_path = mirror_root/"mirror-state.json"
     state = load_state(state_path)
@@ -302,4 +343,3 @@ module GithubMirror
     Log.info { "DONE: #{selected.size} repositories mirrored cleanly" }
   end
 end
-
