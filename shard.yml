@@ -1,5 +1,5 @@
 name: github_mirror
-version: 0.1.0
+version: 0.1.1
 
 description: Keeps local bare mirrors of every GitHub repository a token can see
 repository: https://github.com/Lillevang/github_mirror
